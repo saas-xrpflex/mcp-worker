@@ -1,0 +1,15 @@
+# Acumatica instance
+ACUMATICA_URL=https://your-instance.acumatica.com
+ACUMATICA_TENANT=YourTenant
+
+# Acumatica Connected Application (SM303010) credentials
+ACUMATICA_CLIENT_ID=your-client-id@Production
+ACUMATICA_CLIENT_SECRET=your-client-secret
+
+# Random 256-bit hex key for cookie encryption
+# Generate with: openssl rand -hex 32
+COOKIE_ENCRYPTION_KEY=your-random-hex-key
+
+# Admin console password. Protects /docs/admin (logs, settings, preflight).
+# Generate with: openssl rand -base64 24
+ADMIN_SECRET=your-admin-password
