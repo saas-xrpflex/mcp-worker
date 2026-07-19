@@ -7,6 +7,8 @@ import { docsApp } from "../docs/docs-handler";
 import { logAuthEvent } from "../lib/logger";
 import { encryptString, parseCookies } from "../lib/crypto";
 import { interpretTokenError } from "../lib/preflight";
+import { resolveTenantConfig, TenantConfigError, type TenantConfig } from "../lib/tenant-config";
+import { CloudflareKVStore } from "../platform/cloudflare-kv-store";
 import installScript from "../../install.sh";
 
 // OAuth state cookie — binds the `state` parameter to the browser that
@@ -48,6 +50,7 @@ interface OAuthReqInfo {
 /** Data stored in KV while waiting for consent acknowledgment */
 interface PendingConsent {
   oauthReqInfo: OAuthReqInfo;
+  tenantSlug: string;
   acumaticaUsername: string;
   acumaticaDisplayName: string;
   acumaticaTokens: {
@@ -55,6 +58,41 @@ interface PendingConsent {
     refresh_token: string;
     expires_in: number;
   };
+}
+
+/**
+ * Session 2.4 (multi-tenant) — determine which tenant this OAuth flow is
+ * for. Two sources, in order of preference:
+ *
+ *   1. The RFC 8707 `resource` parameter on the auth request, which MCP
+ *      clients set to the exact resource URL they're connecting to
+ *      (`https://.../mcp/{slug}`) — this is the "real" mechanism and
+ *      matches the /mcp/{tenant_slug} routing decision (MCP.md §Multi-tenant).
+ *      ⚠️ UNVERIFIED: whether @cloudflare/workers-oauth-provider's
+ *      parseAuthRequest() reliably populates `resource`, and whether
+ *      Claude.ai/Claude Desktop actually send it, has not been tested live
+ *      (wrangler is broken on the dev machine that wrote this — see
+ *      apps/mcp/CLAUDE.md session notes). Verify before relying on this
+ *      path in production; the query-param fallback below exists so the
+ *      flow still works if it doesn't.
+ *   2. A `?tenant=` query param on /authorize, for direct testing or as a
+ *      client-side fallback.
+ */
+function extractTenantSlug(
+  oauthReqInfo: { resource?: unknown },
+  requestUrl: string
+): string | null {
+  const resource = oauthReqInfo.resource;
+  if (typeof resource === "string") {
+    try {
+      const match = new URL(resource).pathname.match(/\/mcp\/([^/]+)/);
+      if (match) return decodeURIComponent(match[1]);
+    } catch {
+      // resource wasn't a valid absolute URL — fall through
+    }
+  }
+  const queryTenant = new URL(requestUrl).searchParams.get("tenant");
+  return queryTenant || null;
 }
 
 const app = new Hono<{ Bindings: AuthEnv }>();
@@ -96,20 +134,51 @@ app.get("/authorize", async (c) => {
     return c.text("Invalid OAuth request", 400);
   }
 
+  // Session 2.4 (multi-tenant): resolve which tenant's XRP Flex config to
+  // use for this login. See extractTenantSlug() for the resolution order.
+  const tenantSlug = extractTenantSlug(oauthReqInfo, c.req.url);
+  if (!tenantSlug) {
+    return c.text(
+      "Missing tenant. This server requires a tenant to be specified — connect via " +
+        "the /mcp/{tenant_slug} URL for your organization, or add ?tenant=<slug> for testing.",
+      400
+    );
+  }
+
+  let tenantConfig: TenantConfig;
+  try {
+    tenantConfig = await resolveTenantConfig(
+      tenantSlug,
+      new CloudflareKVStore(c.env.TOKEN_STORE),
+      c.env.INTERNAL_API_URL,
+      c.env.INTERNAL_SERVICE_TOKEN
+    );
+  } catch (err) {
+    const msg = err instanceof TenantConfigError ? err.message : String(err);
+    console.error(`Tenant config resolution failed for '${tenantSlug}': ${msg}`);
+    return c.text(`Configuration error for tenant '${tenantSlug}': ${msg}`, 502);
+  }
+
   const state = crypto.randomUUID();
 
+  // Store the resolved tenant config alongside the OAuth request so
+  // /callback (token exchange, user lookup, access check) uses the exact
+  // same config without a second resolution call — the KV cache in
+  // resolveTenantConfig() would likely return the same thing anyway, but
+  // this avoids any window where the tenant's config could change between
+  // /authorize and /callback (which happen seconds apart in the same flow).
   await c.env.TOKEN_STORE.put(
     `acumatica_state:${state}`,
-    JSON.stringify(oauthReqInfo),
+    JSON.stringify({ oauthReqInfo, tenantSlug, tenantConfig }),
     { expirationTtl: OAUTH_STATE_TTL_SECONDS }
   );
 
   const origin = new URL(c.req.url).origin;
   const acumaticaAuthorizeUrl = new URL(
-    `${c.env.ACUMATICA_URL}/identity/connect/authorize`
+    `${tenantConfig.url}/identity/connect/authorize`
   );
   acumaticaAuthorizeUrl.searchParams.set("response_type", "code");
-  acumaticaAuthorizeUrl.searchParams.set("client_id", c.env.ACUMATICA_CLIENT_ID);
+  acumaticaAuthorizeUrl.searchParams.set("client_id", tenantConfig.clientId);
   acumaticaAuthorizeUrl.searchParams.set(
     "redirect_uri",
     `${origin}/callback`
@@ -174,12 +243,18 @@ app.get("/callback", async (c) => {
     );
   }
 
-  // Retrieve the original MCP OAuth request
+  // Retrieve the original MCP OAuth request + the tenant config resolved
+  // at /authorize time (session 2.4 — see the comment there for why the
+  // config travels with the state record instead of being re-resolved here).
   const stored = await c.env.TOKEN_STORE.get(`acumatica_state:${state}`);
   if (!stored) {
     return c.text("Invalid or expired state. Please try connecting again.", 400);
   }
-  const oauthReqInfo: OAuthReqInfo = JSON.parse(stored);
+  const { oauthReqInfo, tenantSlug, tenantConfig } = JSON.parse(stored) as {
+    oauthReqInfo: OAuthReqInfo;
+    tenantSlug: string;
+    tenantConfig: TenantConfig;
+  };
   await c.env.TOKEN_STORE.delete(`acumatica_state:${state}`);
 
   // Clear the state cookie — it has served its purpose.
@@ -191,15 +266,15 @@ app.get("/callback", async (c) => {
   // Exchange Acumatica code for tokens
   const origin = new URL(c.req.url).origin;
   const tokenResponse = await fetch(
-    `${c.env.ACUMATICA_URL}/identity/connect/token`,
+    `${tenantConfig.url}/identity/connect/token`,
     {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams({
         grant_type: "authorization_code",
         code,
-        client_id: c.env.ACUMATICA_CLIENT_ID,
-        client_secret: c.env.ACUMATICA_CLIENT_SECRET,
+        client_id: tenantConfig.clientId,
+        client_secret: tenantConfig.clientSecret,
         redirect_uri: `${origin}/callback`,
       }),
     }
@@ -246,7 +321,7 @@ app.get("/callback", async (c) => {
   // 3. Fall back to UUID-based key
   try {
     // Attempt 1: OIDC userinfo endpoint
-    const oidcUrl = `${c.env.ACUMATICA_URL}/identity/connect/userinfo`;
+    const oidcUrl = `${tenantConfig.url}/identity/connect/userinfo`;
     console.log(`User info: trying OIDC ${oidcUrl}`);
     const oidcResp = await fetch(oidcUrl, {
       headers: {
@@ -271,7 +346,7 @@ app.get("/callback", async (c) => {
     } else {
       console.log(`User info (OIDC): HTTP ${oidcResp.status}, trying auth contract...`);
       // Attempt 2: auth contract
-      const authUrl = `${c.env.ACUMATICA_URL}/entity/auth/${c.env.ACUMATICA_ENDPOINT_VERSION}/UserSecurityInfo`;
+      const authUrl = `${tenantConfig.url}/entity/auth/${tenantConfig.endpointVersion}/UserSecurityInfo`;
       const authResp = await fetch(authUrl, {
         headers: {
           Authorization: `Bearer ${acumaticaTokens.access_token}`,
@@ -305,10 +380,14 @@ app.get("/callback", async (c) => {
   // the API. Instead we check whether the user's token can read a canary
   // Generic Inquiry over OData. Restrict who can read that GI in Acumatica
   // however you like; a marker role is the recommended way.
+  // Canary GI name stays a global default across tenants for now (every
+  // tenant is instructed in MCP.md to name theirs "MCPAccess") — not part
+  // of tenant_connectors.config_json. Revisit if a tenant ever needs a
+  // different name.
   const canaryGi = c.env.ACUMATICA_CANARY_GI || "MCPAccess";
   const accessResult = await checkAccess(
-    c.env.ACUMATICA_URL,
-    c.env.ACUMATICA_TENANT,
+    tenantConfig.url,
+    tenantConfig.tenant,
     acumaticaTokens.access_token,
     acumaticaUsername,
     canaryGi
@@ -334,6 +413,7 @@ app.get("/callback", async (c) => {
   const consentId = crypto.randomUUID();
   const pendingConsent: PendingConsent = {
     oauthReqInfo,
+    tenantSlug,
     acumaticaUsername,
     acumaticaDisplayName,
     acumaticaTokens,
@@ -383,12 +463,16 @@ app.post("/consent", async (c) => {
   const pending: PendingConsent = JSON.parse(stored);
   await c.env.TOKEN_STORE.delete(`consent:${consentId}`);
 
-  // Store the per-user token in KV. The refresh_token is encrypted at
-  // rest with COOKIE_ENCRYPTION_KEY (AES-256-GCM) — access_token lives
-  // in plaintext because it's short-lived and worthless after expiry.
-  // The record also carries a TTL so a leaked refresh token can't be
-  // used forever after the user stops logging in.
-  const userTokenKey = `user_token:${pending.acumaticaUsername}`;
+  // Store the per-user token in KV, keyed by tenant + username (session
+  // 2.4 — a bare username key would let two tenants' users collide if they
+  // happened to share an Acumatica username on different instances). The
+  // refresh_token is encrypted at rest with COOKIE_ENCRYPTION_KEY
+  // (AES-256-GCM) — access_token lives in plaintext because it's
+  // short-lived and worthless after expiry. The record also carries a TTL
+  // so a leaked refresh token can't be used forever after the user stops
+  // logging in.
+  const tokenIdentity = `${pending.tenantSlug}:${pending.acumaticaUsername}`;
+  const userTokenKey = `user_token:${tokenIdentity}`;
   const encryptedRefresh = await encryptString(
     pending.acumaticaTokens.refresh_token,
     c.env.COOKIE_ENCRYPTION_KEY
@@ -402,13 +486,13 @@ app.post("/consent", async (c) => {
     expirationTtl: USER_TOKEN_TTL_SECONDS,
   });
 
-  // Seed the per-user TokenManager DO directly so its authoritative copy is
-  // fresh immediately — otherwise the DO might read a stale (expired) KV
-  // record in the eventual-consistency window right after re-auth and try to
-  // refresh a dead token. (The DO also adopts from KV on cold read, but
-  // seeding removes the race entirely.)
+  // Seed the per-(tenant,user) TokenManager DO directly so its authoritative
+  // copy is fresh immediately — otherwise the DO might read a stale
+  // (expired) KV record in the eventual-consistency window right after
+  // re-auth and try to refresh a dead token. (The DO also adopts from KV on
+  // cold read, but seeding removes the race entirely.)
   try {
-    const tmId = c.env.TOKEN_MANAGER.idFromName(pending.acumaticaUsername);
+    const tmId = c.env.TOKEN_MANAGER.idFromName(tokenIdentity);
     await c.env.TOKEN_MANAGER.get(tmId).setToken(storedToken);
   } catch (e) {
     // Non-fatal: the DO will adopt the token from KV on its first read.
@@ -426,6 +510,7 @@ app.post("/consent", async (c) => {
     props: {
       acumaticaUsername: pending.acumaticaUsername,
       acumaticaDisplayName: pending.acumaticaDisplayName,
+      tenantSlug: pending.tenantSlug,
     },
   });
 

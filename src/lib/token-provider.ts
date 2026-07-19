@@ -1,6 +1,8 @@
 // Copyright 2026 Hall Boys, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+import type { AcumaticaTokenConfig } from "../auth/acumatica-oauth";
+
 /**
  * Result of resolving an Acumatica access token for a user.
  *
@@ -29,6 +31,14 @@ export type TokenResult =
  * (e.g. Redis SETNX) around the same resolve logic.
  */
 export interface ITokenProvider {
-  /** Return a valid access token for the user, refreshing if necessary. */
-  getAccessToken(username: string): Promise<TokenResult>;
+  /**
+   * Return a valid access token for the user, refreshing if necessary.
+   *
+   * `config` is the CALLER's currently-resolved Acumatica connection info
+   * (session 2.4, multi-tenant — see lib/tenant-config.ts). It's passed on
+   * every call rather than bound once at construction because the owning
+   * DO/lock only persists the token itself; the config to refresh against
+   * must come from whoever resolved it for this request.
+   */
+  getAccessToken(username: string, config: AcumaticaTokenConfig): Promise<TokenResult>;
 }

@@ -1108,6 +1108,11 @@ export interface AppEnv {
  * The McpAgent constructs an AppEnv from an Env at init time.
  */
 export interface Env {
+  // Multi-tenant config resolution (session 2.4) — see lib/tenant-config.ts.
+  // ACUMATICA_URL/TENANT/CLIENT_ID/CLIENT_SECRET below become PER-TENANT
+  // FALLBACKS ONLY (used if tenant resolution fails), not the primary source.
+  INTERNAL_API_URL: string;
+  INTERNAL_SERVICE_TOKEN: string;
   // Acumatica connection (duplicated from AppEnv so CF bindings + secrets populate this directly)
   ACUMATICA_URL: string;
   ACUMATICA_TENANT: string;
@@ -1159,6 +1164,10 @@ export interface OAuthProviderHelpers {
 export type AuthProps = {
   acumaticaUsername: string;
   acumaticaDisplayName: string;
+  // Session 2.4 (multi-tenant): which tenant this MCP session belongs to.
+  // Resolved at /authorize time (see acumatica-auth-handler.ts), carried
+  // through the OAuth state → consent → completeAuthorization props chain.
+  tenantSlug: string;
   [key: string]: unknown;
 };
 

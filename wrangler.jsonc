@@ -156,5 +156,94 @@
 			"bucket_name": "mcp4acumatica-index",
 			"remote": true,"preview_bucket_name": "mcp4acumatica-index"
 		}
-	]
+	],
+
+	// Environnement de test séparé — déploie sous un AUTRE nom de Worker
+	// (mcp-worker-staging), donc un Worker et des Durable Objects
+	// entièrement distincts de la prod. Se déploie avec :
+	//   npx wrangler deploy --env staging
+	// KV/R2 partagés avec la prod (même IDs) — voir MCP.md/CLAUDE.md pour
+	// la décision et ses implications (session 2.4).
+	"env": {
+		"staging": {
+			"name": "mcp-worker-staging",
+			"main": "src/index.ts",
+			"compatibility_date": "2025-03-01",
+			"compatibility_flags": [
+				"nodejs_compat",
+				"global_fetch_strictly_public"
+			],
+			"account_id": "52c3806eefe6ae82eb167d740d673e47",
+
+			"vars": {
+				"INTERNAL_API_URL": "https://orbit-web.adilbekkaye.workers.dev",
+				"ACUMATICA_URL": "https://xrp-flex-partners.cegid.cloud/lebeltechnologies_25r1",
+				"ACUMATICA_TENANT": "Démo",
+				"ACUMATICA_ENDPOINT_VERSION": "25.100.001",
+				"ACUMATICA_ENDPOINT_NAME": "Default",
+				"ACUMATICA_MAX_RECORDS": "1000",
+				"ACUMATICA_CANARY_GI": "MCPAccess"
+			},
+
+			"kv_namespaces": [
+				{
+					"binding": "TOKEN_STORE",
+					"id": "391b13b3bdfa45218718c018cc600a5d"
+				},
+				{
+					"binding": "OAUTH_KV",
+					"id": "8ceea999731b41b2b13e2aad70363545"
+				}
+			],
+
+			"workers_dev": true,
+
+			"durable_objects": {
+				"bindings": [
+					{
+						"name": "MCP_OBJECT",
+						"class_name": "AcumaticaMcpServer"
+					},
+					{
+						"name": "TOKEN_MANAGER",
+						"class_name": "TokenManager"
+					}
+				]
+			},
+			"migrations": [
+				{
+					"tag": "v1",
+					"new_sqlite_classes": ["AcumaticaMcpServer"]
+				},
+				{
+					"tag": "v2",
+					"new_sqlite_classes": ["TokenManager"]
+				}
+			],
+
+			"logpush": false,
+			"observability": { "enabled": true },
+
+			"rules": [
+				{
+					"type": "Text",
+					"globs": ["**/*.md", "**/*.sh"],
+					"fallthrough": true
+				}
+			],
+
+			"r2_buckets": [
+				{
+					"binding": "mcp4acumatica_logs",
+					"bucket_name": "mcp4acumatica-documents",
+					"remote": true, "preview_bucket_name": "mcp4acumatica-documents"
+				},
+				{
+					"binding": "INDEX_STORE",
+					"bucket_name": "mcp4acumatica-index",
+					"remote": true, "preview_bucket_name": "mcp4acumatica-index"
+				}
+			]
+		}
+	}
 }

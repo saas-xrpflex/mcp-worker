@@ -7,16 +7,21 @@ import type { TokenResult } from "./lib/token-provider";
 import {
   refreshAcumaticaToken,
   USER_TOKEN_TTL_SECONDS,
+  type AcumaticaTokenConfig,
 } from "./auth/acumatica-oauth";
 import { decryptString, encryptString } from "./lib/crypto";
 
 const STORAGE_KEY = "token";
 
 /**
- * Per-user Acumatica token owner. One instance per user (the namespace is
- * keyed by `idFromName(acumaticaUsername)`), so EVERY token request for a user
- * — across all of their concurrent MCP sessions / isolates — funnels through
- * this single, globally-consistent Durable Object.
+ * Per-(tenant,user) Acumatica token owner. One instance per (tenant, user)
+ * pair (session 2.4 — the namespace is keyed by `idFromName("{tenantSlug}:
+ * {acumaticaUsername}")`, see platform/do-token-provider.ts), so EVERY token
+ * request for a user in a given tenant — across all of their concurrent MCP
+ * sessions / isolates — funnels through this single, globally-consistent
+ * Durable Object. `username` throughout this class is actually that compound
+ * identity string, not a bare Acumatica username — it's opaque to this DO,
+ * which only uses it as a storage key.
  *
  * Why this exists: IdentityServer rotates the refresh token on every use. With
  * the old per-isolate coalescing, two separate session DOs could each read the
@@ -35,10 +40,14 @@ export class TokenManager extends DurableObject<Env> {
   // not the per-isolate best-effort the old inflightLookups map provided.
   private inflight: Promise<TokenResult> | null = null;
 
-  /** Resolve a valid access token, refreshing (once, serialized) if needed. */
-  async getAccessToken(username: string): Promise<TokenResult> {
+  /**
+   * Resolve a valid access token, refreshing (once, serialized) if needed.
+   * `config` is the tenant's current Acumatica connection info, supplied by
+   * the caller on every request (see ITokenProvider doc comment for why).
+   */
+  async getAccessToken(username: string, config: AcumaticaTokenConfig): Promise<TokenResult> {
     if (this.inflight) return this.inflight;
-    const p = this.resolve(username);
+    const p = this.resolve(username, config);
     this.inflight = p;
     p.finally(() => {
       if (this.inflight === p) this.inflight = null;
@@ -59,7 +68,7 @@ export class TokenManager extends DurableObject<Env> {
     this.inflight = null;
   }
 
-  private async resolve(username: string): Promise<TokenResult> {
+  private async resolve(username: string, config: AcumaticaTokenConfig): Promise<TokenResult> {
     let stored: StoredToken | undefined;
     try {
       stored = await this.readToken(username);
@@ -103,15 +112,11 @@ export class TokenManager extends DurableObject<Env> {
       };
     }
 
-    const outcome = await refreshAcumaticaToken(
-      {
-        url: this.env.ACUMATICA_URL,
-        clientId: this.env.ACUMATICA_CLIENT_ID,
-        clientSecret: this.env.ACUMATICA_CLIENT_SECRET,
-      },
-      refreshToken,
-      username
-    );
+    // Uses the caller-supplied tenant config, NOT this.env.ACUMATICA_* — the
+    // DO's own env is the Worker's global fallback config, which would be
+    // wrong for any tenant other than whichever one owns those wrangler.jsonc
+    // values. See ITokenProvider / DOTokenProvider for how config gets here.
+    const outcome = await refreshAcumaticaToken(config, refreshToken, username);
 
     if (outcome.status === "ok") {
       const encryptedRefresh = await encryptString(

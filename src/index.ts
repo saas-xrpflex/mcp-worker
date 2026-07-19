@@ -30,6 +30,7 @@ import { CloudflareR2BlobStore } from "./platform/cloudflare-r2-blob-store";
 import { DOTokenProvider } from "./platform/do-token-provider";
 import { AcumaticaAuthHandler } from "./auth/acumatica-auth-handler";
 import { ReauthRequiredError } from "./auth/acumatica-oauth";
+import { resolveTenantConfig, TenantConfigError } from "./lib/tenant-config";
 
 // Re-exported so the Cloudflare runtime can find the DO class named in
 // wrangler.jsonc's durable_objects bindings / migrations.
@@ -64,25 +65,53 @@ export class AcumaticaMcpServer extends McpAgent<Env, Record<string, unknown>, A
   private static readonly LOG_BUFFER_KEY = "log_buffer";
 
   async init() {
-    // Build the platform-agnostic AppEnv from the Cloudflare bindings.
-    // We construct a fresh object rather than mutating `this.env`; the CF
-    // runtime may share that env reference across requests in the same
-    // isolate, so hot-patching a `store` field onto it would be a
-    // cross-request side effect masquerading as instance state.
+    // Session 2.4 (multi-tenant): resolve this session's tenant's XRP Flex
+    // config instead of trusting the Worker's global wrangler.jsonc vars.
+    // this.props is set once, at OAuth completion (acumatica-auth-handler.ts
+    // /consent), and persists for the lifetime of this DO/session.
+    //
+    // ⚠️ UNVERIFIED end-to-end: this whole multi-tenant path has not been
+    // exercised against a live deployment (see MCP.md §Multi-tenant — the
+    // dev machine that wrote this can't run `wrangler dev`). Config
+    // resolution itself (lib/tenant-config.ts → the Next.js internal API)
+    // was tested directly and works; this wiring has only been reviewed,
+    // not run.
+    const store = new CloudflareKVStore(this.env.TOKEN_STORE);
+    const tenantSlug = this.props.tenantSlug;
+    let tenantConfig;
+    try {
+      tenantConfig = await resolveTenantConfig(
+        tenantSlug,
+        store,
+        this.env.INTERNAL_API_URL,
+        this.env.INTERNAL_SERVICE_TOKEN
+      );
+    } catch (e) {
+      const msg = e instanceof TenantConfigError ? e.message : String(e);
+      console.error(`init(): tenant config resolution failed for '${tenantSlug}': ${msg}`);
+      throw e;
+    }
+
+    // Build the platform-agnostic AppEnv from the resolved tenant config +
+    // the remaining Cloudflare bindings. We construct a fresh object rather
+    // than mutating `this.env`; the CF runtime may share that env reference
+    // across requests in the same isolate, so hot-patching a `store` field
+    // onto it would be a cross-request side effect masquerading as instance
+    // state.
     this.appEnv = {
-      ACUMATICA_URL: this.env.ACUMATICA_URL,
-      ACUMATICA_TENANT: this.env.ACUMATICA_TENANT,
-      ACUMATICA_ENDPOINT_VERSION: this.env.ACUMATICA_ENDPOINT_VERSION,
+      ACUMATICA_URL: tenantConfig.url,
+      ACUMATICA_TENANT: tenantConfig.tenant,
+      ACUMATICA_ENDPOINT_VERSION: tenantConfig.endpointVersion,
       ACUMATICA_ENDPOINT_NAME: this.env.ACUMATICA_ENDPOINT_NAME,
       ACUMATICA_MAX_RECORDS: this.env.ACUMATICA_MAX_RECORDS,
-      ACUMATICA_CLIENT_ID: this.env.ACUMATICA_CLIENT_ID,
-      ACUMATICA_CLIENT_SECRET: this.env.ACUMATICA_CLIENT_SECRET,
+      ACUMATICA_CLIENT_ID: tenantConfig.clientId,
+      ACUMATICA_CLIENT_SECRET: tenantConfig.clientSecret,
       COOKIE_ENCRYPTION_KEY: this.env.COOKIE_ENCRYPTION_KEY,
       ACUMATICA_WRITES_ENABLED: this.env.ACUMATICA_WRITES_ENABLED,
       REDACT_PATTERNS: this.env.REDACT_PATTERNS,
       REDACT_SKIP: this.env.REDACT_SKIP,
-      store: new CloudflareKVStore(this.env.TOKEN_STORE),
-      tokenProvider: new DOTokenProvider(this.env.TOKEN_MANAGER),
+      store,
+      tokenProvider: new DOTokenProvider(this.env.TOKEN_MANAGER, tenantSlug),
       indexStore: this.env.INDEX_STORE ? new CloudflareR2BlobStore(this.env.INDEX_STORE) : undefined,
     };
 

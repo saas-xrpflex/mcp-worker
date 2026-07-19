@@ -128,7 +128,16 @@ export async function getAcumaticaTokenForUser(
   env: AppEnv,
   acumaticaUsername: string
 ): Promise<string> {
-  const result = await env.tokenProvider.getAccessToken(acumaticaUsername);
+  // env.ACUMATICA_* is already resolved for the current tenant (session 2.4
+  // — populated in AcumaticaMcpServer.init() from tenant-config.ts, not from
+  // the Worker's raw wrangler.jsonc bindings), so this is safe to forward
+  // as-is to whatever refresh eventually happens.
+  const config: AcumaticaTokenConfig = {
+    url: env.ACUMATICA_URL,
+    clientId: env.ACUMATICA_CLIENT_ID,
+    clientSecret: env.ACUMATICA_CLIENT_SECRET,
+  };
+  const result = await env.tokenProvider.getAccessToken(acumaticaUsername, config);
   switch (result.status) {
     case "ok":
       return result.accessToken;
