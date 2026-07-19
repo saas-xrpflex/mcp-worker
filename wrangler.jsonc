@@ -26,9 +26,12 @@
 	],
 	"account_id": "52c3806eefe6ae82eb167d740d673e47",
 
+	// INTERNAL_API_URL : route interne Next.js pour la résolution de config
+	// multi-tenant (session 2.4, voir lib/tenant-config.ts et MCP.md §Multi-tenant).
 	// Acumatica instance configuration. Edit these for your deployment
 	// (or leave the placeholders and override via the dashboard after deploy).
 	"vars": {
+		"INTERNAL_API_URL": "https://orbit-web.adilbekkaye.workers.dev",
 		"ACUMATICA_URL": "https://xrp-flex-partners.cegid.cloud/lebeltechnologies_25r1",
 		"ACUMATICA_TENANT": "Démo",
 		"ACUMATICA_ENDPOINT_VERSION": "25.100.001",
