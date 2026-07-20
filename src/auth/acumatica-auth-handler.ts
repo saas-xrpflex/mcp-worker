@@ -18,6 +18,11 @@ import installScript from "../../install.sh";
 const OAUTH_STATE_COOKIE = "acu_oauth_state";
 const OAUTH_STATE_TTL_SECONDS = 600;
 
+// Redirect URI bidon du client OAuth permanent "Orbit Web (internal token
+// mint)" — jamais réellement visitée, requise uniquement pour la validation
+// de l'AuthRequest synthétique (session 2.6, voir /internal/mint-mcp-token).
+const MINT_REDIRECT_URI = "https://orbit-web.adilbekkaye.workers.dev/internal/oauth-noop-callback";
+
 // KV TTL for per-user Acumatica tokens. Long enough that normal users
 // don't have to re-auth mid-day, short enough to bound the blast radius
 // of a stolen refresh token.
@@ -589,6 +594,130 @@ app.post("/internal/store-token", async (c) => {
   logAuthEvent("token_stored_via_internal_api", acumaticaUsername, { tenantSlug });
 
   return c.json({ ok: true });
+});
+
+// ──────────────────────────────────────────────────────────────
+// POST /internal/mint-mcp-token — mint synthétique d'un token MCP pour un
+// utilisateur déjà authentifié via l'OAuth Acumatica mené par apps/web
+// (session 2.6). Reproduit exactement ce que /consent ferait pour un vrai
+// client MCP (Claude.ai), sauf qu'ici c'est le client OAuth permanent
+// "Orbit Web" (INTERNAL_MCP_CLIENT_ID/SECRET) qui joue ce rôle, et que
+// l'échange authorization_code → access_token se fait en mémoire (voir
+// plus bas) plutôt que via un vrai aller-retour réseau — évite l'erreur
+// Cloudflare 1042 rencontrée avec un fetch() public vers *.workers.dev.
+// ──────────────────────────────────────────────────────────────
+app.post("/internal/mint-mcp-token", async (c) => {
+  const authHeader = c.req.header("authorization");
+  const expected = `Bearer ${c.env.INTERNAL_SERVICE_TOKEN}`;
+  if (!c.env.INTERNAL_SERVICE_TOKEN || authHeader !== expected) {
+    return c.json({ error: "Non autorisé" }, 401);
+  }
+
+  let body: {
+    tenantSlug?: string;
+    acumaticaUsername?: string;
+    acumaticaDisplayName?: string;
+  };
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json({ error: "Corps de requête JSON invalide" }, 400);
+  }
+
+  const { tenantSlug, acumaticaUsername, acumaticaDisplayName } = body;
+  if (!tenantSlug || !acumaticaUsername) {
+    return c.json({ error: "Champs requis : tenantSlug, acumaticaUsername" }, 400);
+  }
+
+  if (!c.env.INTERNAL_MCP_CLIENT_ID || !c.env.INTERNAL_MCP_CLIENT_SECRET) {
+    return c.json(
+      { error: "Client OAuth interne non configuré (INTERNAL_MCP_CLIENT_ID/SECRET)" },
+      500
+    );
+  }
+
+  // 1. AuthRequest synthétique — même scope que oauthProviderOptions.scopesSupported.
+  const authRequest = {
+    responseType: "code",
+    clientId: c.env.INTERNAL_MCP_CLIENT_ID,
+    redirectUri: MINT_REDIRECT_URI,
+    scope: ["api"],
+    state: crypto.randomUUID(), // requis par le type, jamais relu ensuite
+  };
+
+  // 2. Crée le grant + code d'autorisation — mêmes props que /consent poserait
+  // sur une vraie session MCP (this.props côté AcumaticaMcpServer).
+  let redirectTo: string;
+  try {
+    const result = await c.env.OAUTH_PROVIDER.completeAuthorization({
+      request: authRequest,
+      userId: acumaticaUsername,
+      metadata: { label: acumaticaDisplayName ?? acumaticaUsername },
+      scope: ["api"],
+      props: { acumaticaUsername, acumaticaDisplayName, tenantSlug },
+    });
+    redirectTo = result.redirectTo;
+  } catch (err) {
+    console.error(
+      "mint-mcp-token: completeAuthorization failed:",
+      err instanceof Error ? err.message : err
+    );
+    return c.json({ error: "Échec de la création du grant MCP" }, 502);
+  }
+
+  // 3. Extrait le code — l'URL n'est jamais réellement suivie.
+  const code = new URL(redirectTo).searchParams.get("code");
+  if (!code) {
+    return c.json({ error: "Code d'autorisation manquant dans la réponse" }, 502);
+  }
+
+  // 4. Échange le code contre le vrai access_token — appel EN MÉMOIRE (pas
+  // réseau) sur ce même Worker. Import différé pour casser le cycle
+  // d'import avec index.ts (qui importe AcumaticaAuthHandler depuis ce
+  // fichier) : une résolution au niveau module échouerait / renverrait
+  // undefined tant qu'index.ts n'a pas fini de s'évaluer.
+  const { default: mcpWorker } = await import("../index");
+
+  const tokenRequest = new Request("https://internal/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "authorization_code",
+      code,
+      client_id: c.env.INTERNAL_MCP_CLIENT_ID,
+      client_secret: c.env.INTERNAL_MCP_CLIENT_SECRET,
+      redirect_uri: MINT_REDIRECT_URI,
+    }),
+  });
+
+  // Cast : Hono type c.executionCtx contre une définition ExecutionContext
+  // légèrement différente de celle attendue par @cloudflare/workers-oauth-provider
+  // (désaccord de version entre les deux packages sur ce type ambiant) — le
+  // même objet réel est fourni par le runtime Cloudflare dans les deux cas.
+  const tokenResponse = await mcpWorker.fetch(
+    tokenRequest,
+    c.env,
+    c.executionCtx as unknown as Parameters<typeof mcpWorker.fetch>[2]
+  );
+  const tokenData = await tokenResponse.json();
+
+  if (!tokenResponse.ok) {
+    console.error(
+      "mint-mcp-token: /token exchange failed:",
+      tokenResponse.status,
+      JSON.stringify(tokenData)
+    );
+    return c.json(
+      { error: "Échec de l'échange du code contre un token MCP", detail: tokenData },
+      502
+    );
+  }
+
+  logAuthEvent("token_minted_via_internal_api", acumaticaUsername, { tenantSlug });
+
+  // 5. Réponse /token retournée telle quelle (access_token, token_type,
+  // expires_in, scope, refresh_token le cas échéant).
+  return c.json(tokenData, 200);
 });
 
 // OpenID Connect discovery — some MCP clients (e.g. ChatGPT) also check this

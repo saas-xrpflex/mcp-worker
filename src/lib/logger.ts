@@ -41,7 +41,8 @@ export function logAuthEvent(
     | "login_denied"
     | "consent_accepted"
     | "callback_state_mismatch"
-    | "token_stored_via_internal_api",
+    | "token_stored_via_internal_api"
+    | "token_minted_via_internal_api",
   username: string,
   details?: Record<string, unknown>
 ): void {

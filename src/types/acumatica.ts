@@ -1123,6 +1123,11 @@ export interface Env {
   ACUMATICA_CLIENT_ID: string;
   ACUMATICA_CLIENT_SECRET: string;
   COOKIE_ENCRYPTION_KEY: string;
+  // Client OAuth permanent d'apps/web pour le mint synthétique de tokens MCP
+  // (session 2.6 — voir /internal/mint-mcp-token). Créé une fois via
+  // apps/mcp/_tmp_create_internal_client.mjs (supprimé après exécution).
+  INTERNAL_MCP_CLIENT_ID: string;
+  INTERNAL_MCP_CLIENT_SECRET: string;
   // Access gate — name of the canary Generic Inquiry queried over OData to
   // verify a user may use MCP (default: "MCPAccess"). Restrict who can read
   // this GI in Acumatica however you like; a marker role is the recommended way.
