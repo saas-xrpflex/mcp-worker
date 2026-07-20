@@ -95,6 +95,40 @@ function extractTenantSlug(
   return queryTenant || null;
 }
 
+/**
+ * Persist a user's Acumatica token: encrypt the refresh token, write the
+ * KV backup, and seed the authoritative TokenManager DO. Shared by /consent
+ * (fresh browser login, session 2.4/2.5) and /internal/store-token
+ * (session-driven OAuth initiated from apps/web — session 2.6).
+ */
+async function storeUserToken(
+  env: AuthEnv,
+  tenantSlug: string,
+  acumaticaUsername: string,
+  token: { access_token: string; refresh_token: string; expires_at: number }
+): Promise<void> {
+  const tokenIdentity = `${tenantSlug}:${acumaticaUsername}`;
+  const userTokenKey = `user_token:${tokenIdentity}`;
+  const encryptedRefresh = await encryptString(token.refresh_token, env.COOKIE_ENCRYPTION_KEY);
+  const storedToken = {
+    access_token: token.access_token,
+    refresh_token: encryptedRefresh,
+    expires_at: token.expires_at,
+  };
+
+  await env.TOKEN_STORE.put(userTokenKey, JSON.stringify(storedToken), {
+    expirationTtl: USER_TOKEN_TTL_SECONDS,
+  });
+
+  try {
+    const tmId = env.TOKEN_MANAGER.idFromName(tokenIdentity);
+    await env.TOKEN_MANAGER.get(tmId).setToken(storedToken);
+  } catch (e) {
+    // Non-fatal: the DO will adopt the token from KV on its first read.
+    console.warn("TokenManager seed failed (will adopt from KV):", e instanceof Error ? e.message : e);
+  }
+}
+
 const app = new Hono<{ Bindings: AuthEnv }>();
 
 // ──────────────────────────────────────────────────────────────
@@ -471,33 +505,16 @@ app.post("/consent", async (c) => {
   // short-lived and worthless after expiry. The record also carries a TTL
   // so a leaked refresh token can't be used forever after the user stops
   // logging in.
-  const tokenIdentity = `${pending.tenantSlug}:${pending.acumaticaUsername}`;
-  const userTokenKey = `user_token:${tokenIdentity}`;
-  const encryptedRefresh = await encryptString(
-    pending.acumaticaTokens.refresh_token,
-    c.env.COOKIE_ENCRYPTION_KEY
-  );
-  const storedToken = {
-    access_token: pending.acumaticaTokens.access_token,
-    refresh_token: encryptedRefresh,
-    expires_at: Date.now() + pending.acumaticaTokens.expires_in * 1000,
-  };
-  await c.env.TOKEN_STORE.put(userTokenKey, JSON.stringify(storedToken), {
-    expirationTtl: USER_TOKEN_TTL_SECONDS,
-  });
-
   // Seed the per-(tenant,user) TokenManager DO directly so its authoritative
   // copy is fresh immediately — otherwise the DO might read a stale
   // (expired) KV record in the eventual-consistency window right after
   // re-auth and try to refresh a dead token. (The DO also adopts from KV on
   // cold read, but seeding removes the race entirely.)
-  try {
-    const tmId = c.env.TOKEN_MANAGER.idFromName(tokenIdentity);
-    await c.env.TOKEN_MANAGER.get(tmId).setToken(storedToken);
-  } catch (e) {
-    // Non-fatal: the DO will adopt the token from KV on its first read.
-    console.warn("TokenManager seed failed (will adopt from KV):", e instanceof Error ? e.message : e);
-  }
+  await storeUserToken(c.env, pending.tenantSlug, pending.acumaticaUsername, {
+    access_token: pending.acumaticaTokens.access_token,
+    refresh_token: pending.acumaticaTokens.refresh_token,
+    expires_at: Date.now() + pending.acumaticaTokens.expires_in * 1000,
+  });
 
   logAuthEvent("consent_accepted", pending.acumaticaUsername);
 
@@ -517,6 +534,61 @@ app.post("/consent", async (c) => {
   logAuthEvent("login_success", pending.acumaticaUsername);
 
   return c.redirect(redirectTo);
+});
+
+// ──────────────────────────────────────────────────────────────
+// POST /internal/store-token — service-to-service token write, appelé par
+// apps/web après avoir mené lui-même l'échange OAuth Authorization Code
+// avec Acumatica (session 2.6 — flow OAuth utilisateur dans le chat).
+// Sens inverse de resolveTenantConfig() qui appelle apps/web depuis ici ;
+// même mécanisme d'auth (INTERNAL_SERVICE_TOKEN), dans l'autre sens.
+// Réutilise exactement la persistance de /consent via storeUserToken().
+// ──────────────────────────────────────────────────────────────
+app.post("/internal/store-token", async (c) => {
+  const authHeader = c.req.header("authorization");
+  const expected = `Bearer ${c.env.INTERNAL_SERVICE_TOKEN}`;
+  if (!c.env.INTERNAL_SERVICE_TOKEN || authHeader !== expected) {
+    return c.json({ error: "Non autorisé" }, 401);
+  }
+
+  let body: {
+    tenantSlug?: string;
+    acumaticaUsername?: string;
+    storedToken?: { access_token?: string; refresh_token?: string; expires_at?: number };
+  };
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json({ error: "Corps de requête JSON invalide" }, 400);
+  }
+
+  const { tenantSlug, acumaticaUsername, storedToken } = body;
+  if (
+    !tenantSlug ||
+    !acumaticaUsername ||
+    !storedToken ||
+    typeof storedToken.access_token !== "string" ||
+    typeof storedToken.refresh_token !== "string" ||
+    typeof storedToken.expires_at !== "number"
+  ) {
+    return c.json(
+      {
+        error:
+          "Champs requis : tenantSlug, acumaticaUsername, storedToken.{access_token,refresh_token,expires_at}",
+      },
+      400
+    );
+  }
+
+  await storeUserToken(c.env, tenantSlug, acumaticaUsername, {
+    access_token: storedToken.access_token,
+    refresh_token: storedToken.refresh_token,
+    expires_at: storedToken.expires_at,
+  });
+
+  logAuthEvent("token_stored_via_internal_api", acumaticaUsername, { tenantSlug });
+
+  return c.json({ ok: true });
 });
 
 // OpenID Connect discovery — some MCP clients (e.g. ChatGPT) also check this
