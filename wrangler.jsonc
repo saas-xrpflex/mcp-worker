@@ -32,9 +32,9 @@
 	// (or leave the placeholders and override via the dashboard after deploy).
 	"vars": {
 		"INTERNAL_API_URL": "https://orbit-web.adilbekkaye.workers.dev",
-		"ACUMATICA_URL": "https://xrp-flex-partners.cegid.cloud/lebeltechnologies_25r1",
+		"ACUMATICA_URL": "https://xrp-flex-partners.cegid.cloud/lebeltechnologies_24r2",
 		"ACUMATICA_TENANT": "Démo",
-		"ACUMATICA_ENDPOINT_VERSION": "25.100.001",
+		"ACUMATICA_ENDPOINT_VERSION": "24.200.001",
 		"ACUMATICA_ENDPOINT_NAME": "Default",
 		"ACUMATICA_MAX_RECORDS": "1000",
 		"ACUMATICA_CANARY_GI": "MCPAccess"
@@ -177,9 +177,9 @@
 
 			"vars": {
 				"INTERNAL_API_URL": "https://orbit-web.adilbekkaye.workers.dev",
-				"ACUMATICA_URL": "https://xrp-flex-partners.cegid.cloud/lebeltechnologies_25r1",
+				"ACUMATICA_URL": "https://xrp-flex-partners.cegid.cloud/lebeltechnologies_24r2",
 				"ACUMATICA_TENANT": "Démo",
-				"ACUMATICA_ENDPOINT_VERSION": "25.100.001",
+				"ACUMATICA_ENDPOINT_VERSION": "24.200.001",
 				"ACUMATICA_ENDPOINT_NAME": "Default",
 				"ACUMATICA_MAX_RECORDS": "1000",
 				"ACUMATICA_CANARY_GI": "MCPAccess"
